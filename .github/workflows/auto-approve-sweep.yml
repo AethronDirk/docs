@@ -1,0 +1,135 @@
+name: Auto-approve PR sweep (Aethron-Bot)
+
+# Centraal beheerd in AethronTech/.github (gesynct naar alle repo's, samen met
+# auto-approve.yml — zie sync-auto-approve.yml).
+#
+# AETHRON-119: vangnet naast auto-approve.yml. Die reageert op workflow_run
+# van een vaste naamlijst en evalueert enkel op het moment dat ÉÉN van die
+# workflows afrondt — als een andere, parallelle check op dat moment nog
+# loopt, komt er geen gegarandeerde her-evaluatie zodra die ook klaar is.
+# Vier bevestigde occurrences (02/09 t/m 05/09) op verschillende
+# projecten/repo's, incl. één geval (aethron-monorepo PR #293, AECRM-30) waar
+# de Code-lus' eigen wait_for_pr_merge() daardoor de volle 3600s-timeout
+# afliep.
+#
+# Trigger op check_suite i.p.v. workflow_run bleek GEEN structurele fix:
+# empirisch bevestigd op diezelfde PR #293 dat één commit met twee
+# workflow-bestanden ("CI" + "Semgrep SAST") twee LOSSE "GitHub Actions"
+# check_suites oplevert, met duidelijk verschillende completion-tijdstippen.
+# check_suite heeft dus exact dezelfde "laatste-afronder-wint"-race als
+# workflow_run — enkel op een andere granulariteit, en met hogere
+# Actions-kosten (elke check_suite-completion triggert een aparte
+# evaluatie-job, elk minimaal 1 gefactureerde minuut; workflow_run i.c.m.
+# een naamlijst was destijds bewust gekozen om dat te vermijden, zie de
+# commit-boodschap van a25d017).
+#
+# Deze sweep lost het topologie-onafhankelijk op: elke 10 min doorloopt ze
+# alle open PR's en approve't/merget elke PR waarvan de volledige
+# check-status al groen is maar die nog niet door de bot benaderd is —
+# ongeacht hoeveel workflow-bestanden/check-suites er voor die commit
+# bestonden of in welke volgorde ze afrondden. auto-approve.yml blijft
+# ongewijzigd als snelle happy-path voor het overgrote-meerderheid-geval
+# waarin alles wél op tijd samenvalt; deze sweep is enkel het vangnet voor
+# de resterende gevallen, met een harde bovengrens van ~10 min i.p.v. de
+# vorige "kan voor altijd blijven hangen tot iemand het toevallig opmerkt".
+#
+# `workflow_dispatch` staat erbij voor handmatig testen/forceren zonder op
+# de cron te wachten (zo geverifieerd tegen een kunstmatige vertraagde-
+# check-race in een wegwerp-testrepo vóór uitrol, zie AETHRON-119).
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Generate Aethron-Bot token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.AETHRON_BOT_APP_ID }}
+          private-key: ${{ secrets.AETHRON_BOT_PRIVATE_KEY }}
+
+      - name: Sweep open PRs and approve/merge fully-green ones
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100,
+            });
+
+            for (const pr of prs) {
+              if (pr.draft) {
+                console.log(`PR #${pr.number}: draft — skipping`);
+                continue;
+              }
+
+              // Verify all check runs for this PR's head SHA are successful
+              // (zelfde criterium als auto-approve.yml, hier toegepast per
+              // PR i.p.v. per event).
+              const { data: checkRuns } = await github.rest.checks.listForRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: pr.head.sha,
+              });
+
+              const relevant = checkRuns.check_runs.filter(
+                r => r.name !== 'Auto-approve PR (Aethron-Bot)' &&
+                     r.name !== 'sweep'
+              );
+              if (relevant.length === 0) {
+                console.log(`PR #${pr.number}: no check runs yet — skipping`);
+                continue;
+              }
+              const allPassed = relevant.every(
+                r => r.status === 'completed' && (r.conclusion === 'success' || r.conclusion === 'skipped' || r.conclusion === 'neutral')
+              );
+              if (!allPassed) {
+                console.log(`PR #${pr.number}: not all checks passed yet — skipping`);
+                continue;
+              }
+
+              // Skip if already approved by a bot
+              const { data: reviews } = await github.rest.pulls.listReviews({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+              });
+              const alreadyApproved = reviews.some(
+                r => r.state === 'APPROVED' && r.user.type === 'Bot'
+              );
+              if (alreadyApproved) {
+                console.log(`PR #${pr.number}: already approved — skipping`);
+                continue;
+              }
+
+              await github.rest.pulls.createReview({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+                event: 'APPROVE',
+                body: '✅ All checks passed — auto-approved by Aethron-Bot (sweep, AETHRON-119).',
+              });
+              console.log(`✅ Approved PR #${pr.number} via sweep`);
+
+              // Auto-merge
+              try {
+                await github.rest.pulls.merge({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pr.number,
+                  merge_method: 'merge',
+                });
+                console.log(`🔀 Merged PR #${pr.number} via sweep`);
+              } catch (err) {
+                console.log(`⚠️ Could not merge PR #${pr.number}: ${err.message}`);
+              }
+            }
